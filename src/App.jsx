@@ -31,6 +31,102 @@ const STATUS = {
   CANCELLED: "CANCELLED",
 };
 
+// Android Web Push configuration. Only the public VAPID key belongs in the frontend.
+const VAPID_PUBLIC_KEY = import.meta.env.VITE_VAPID_PUBLIC_KEY || "";
+const PUSH_FUNCTION_NAME = "send-appointment-notification";
+
+function urlBase64ToUint8Array(base64String) {
+  const padding = "=".repeat((4 - (base64String.length % 4)) % 4);
+  const base64 = (base64String + padding)
+    .replace(/-/g, "+")
+    .replace(/_/g, "/");
+  const rawData = window.atob(base64);
+  return Uint8Array.from([...rawData].map((char) => char.charCodeAt(0)));
+}
+
+async function enablePushNotifications(userId) {
+  if (!userId) throw new Error("User is not signed in.");
+  if (!VAPID_PUBLIC_KEY) {
+    throw new Error("VITE_VAPID_PUBLIC_KEY is missing from .env.local.");
+  }
+  if (!("Notification" in window)) {
+    throw new Error("Notifications are not supported by this browser.");
+  }
+  if (!("PushManager" in window)) {
+    throw new Error("Push notifications are not supported by this browser.");
+  }
+  if (!("serviceWorker" in navigator)) {
+    throw new Error("Service workers are not supported by this browser.");
+  }
+
+  const permission = await Notification.requestPermission();
+  if (permission !== "granted") {
+    throw new Error("Notification permission was not granted.");
+  }
+
+  const registration = await navigator.serviceWorker.ready;
+  let subscription = await registration.pushManager.getSubscription();
+
+  if (!subscription) {
+    subscription = await registration.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: urlBase64ToUint8Array(VAPID_PUBLIC_KEY),
+    });
+  }
+
+  const subscriptionJson = subscription.toJSON();
+  const endpoint = subscriptionJson.endpoint;
+  const p256dh = subscriptionJson.keys?.p256dh;
+  const auth = subscriptionJson.keys?.auth;
+
+  if (!endpoint || !p256dh || !auth) {
+    throw new Error("The browser returned an invalid push subscription.");
+  }
+
+  const { error } = await supabase.from("push_subscriptions").upsert(
+    {
+      user_id: userId,
+      endpoint,
+      p256dh,
+      auth,
+      user_agent: navigator.userAgent,
+      updated_at: new Date().toISOString(),
+    },
+    { onConflict: "user_id,endpoint" }
+  );
+
+  if (error) throw error;
+  return subscription;
+}
+
+async function sendAppointmentPush(appointment, event, senderUserId) {
+  if (!appointment?.id || !supabase) return;
+
+  try {
+    const { data, error } = await supabase.functions.invoke(
+      PUSH_FUNCTION_NAME,
+      {
+        body: {
+          appointment,
+          event,
+          sender_user_id: senderUserId,
+        },
+      }
+    );
+
+    if (error) {
+      console.error("Appointment push request failed:", error);
+      return { ok: false, error };
+    }
+
+    return { ok: true, data };
+  } catch (error) {
+    console.error("Appointment push request failed:", error);
+    return { ok: false, error };
+  }
+}
+
+
 function localDateString(date = new Date()) {
   const d = new Date(date);
   const offset = d.getTimezoneOffset();
@@ -224,6 +320,8 @@ function Dashboard({ session, profile, onSignOut }) {
   const [doctorFilter, setDoctorFilter] = useState("ALL");
   const [modal, setModal] = useState(null);
   const [toast, setToast] = useState(null);
+  const [pushBusy, setPushBusy] = useState(false);
+  const [pushEnabled, setPushEnabled] = useState(false);
 
   const userName =
     profile?.full_name || session.user.user_metadata?.full_name || session.user.email;
@@ -277,6 +375,45 @@ function Dashboard({ session, profile, onSignOut }) {
   }, [appointments, selectedDate]);
 
   useEffect(() => {
+    async function checkPushStatus() {
+      if (
+        !session?.user?.id ||
+        !("serviceWorker" in navigator) ||
+        !("PushManager" in window)
+      ) return;
+
+      try {
+        const registration = await navigator.serviceWorker.ready;
+        const subscription = await registration.pushManager.getSubscription();
+        setPushEnabled(Boolean(subscription));
+      } catch (error) {
+        console.error("Unable to check push status:", error);
+      }
+    }
+
+    checkPushStatus();
+  }, [session?.user?.id]);
+
+  async function handleEnableNotifications() {
+    if (pushBusy || !session?.user?.id) return;
+    setPushBusy(true);
+
+    try {
+      await enablePushNotifications(session.user.id);
+      setPushEnabled(true);
+      setToast({ type: "success", message: "Phone notifications enabled." });
+    } catch (error) {
+      console.error("Unable to enable phone notifications:", error);
+      setToast({
+        type: "error",
+        message: error?.message || "Unable to enable phone notifications.",
+      });
+    } finally {
+      setPushBusy(false);
+    }
+  }
+
+  useEffect(() => {
     loadAppointments();
 
     const channel = supabase
@@ -284,7 +421,28 @@ function Dashboard({ session, profile, onSignOut }) {
       .on(
         "postgres_changes",
         { event: "*", schema: "public", table: "appointments" },
-        () => loadAppointments(true)
+        (payload) => {
+          // Realtime is used for live dashboard updates and in-app toasts.
+          // System notifications are sent by the Edge Function to avoid duplicates.
+          if (payload.eventType === "INSERT") {
+            const appointment = payload.new;
+            const bookedByMe = appointment.created_by === session.user.id;
+
+            if (!bookedByMe) {
+              const body = `${appointment.name}${
+                appointment.doctor_name ? ` with ${appointment.doctor_name}` : ""
+              } on ${formatDate(appointment.appointment_date)} at ${formatTime(
+                appointment.appointment_time
+              )}`;
+              setToast({
+                type: "success",
+                message: `New appointment booked: ${body}`,
+              });
+            }
+          }
+
+          loadAppointments(true);
+        }
       )
       .subscribe();
 
@@ -322,20 +480,22 @@ function Dashboard({ session, profile, onSignOut }) {
   async function saveAppointment(form, editingId) {
     const payload = {
       name: form.name.trim(),
-      mobile: form.mobile.trim(),
+      mobile: form.mobile.trim() || null,
       appointment_date: form.appointment_date,
       appointment_time: form.appointment_time,
-      doctor_name: form.doctor_name.trim(),
+      doctor_name: form.doctor_name.trim() || null,
       age: form.age ? Number(form.age) : null,
       treatment: form.treatment.trim() || null,
       case_no: form.case_no.trim() || null,
     };
 
     if (editingId) {
-      const { error } = await supabase
+      const { data: updatedAppointment, error } = await supabase
         .from("appointments")
         .update(payload)
-        .eq("id", editingId);
+        .eq("id", editingId)
+        .select("*")
+        .single();
 
       if (error) {
         setToast({ type: "error", message: friendlyDbError(error) });
@@ -343,12 +503,17 @@ function Dashboard({ session, profile, onSignOut }) {
       }
 
       setToast({ type: "success", message: "Appointment updated." });
+      await sendAppointmentPush(updatedAppointment, "UPDATE", session.user.id);
     } else {
-      const { error } = await supabase.from("appointments").insert({
-        ...payload,
-        status: STATUS.SCHEDULED,
-        created_by: session.user.id,
-      });
+      const { data: createdAppointment, error } = await supabase
+        .from("appointments")
+        .insert({
+          ...payload,
+          status: STATUS.SCHEDULED,
+          created_by: session.user.id,
+        })
+        .select("*")
+        .single();
 
       if (error) {
         setToast({ type: "error", message: friendlyDbError(error) });
@@ -356,6 +521,7 @@ function Dashboard({ session, profile, onSignOut }) {
       }
 
       setToast({ type: "success", message: "Appointment created." });
+      await sendAppointmentPush(createdAppointment, "INSERT", session.user.id);
     }
 
     setModal(null);
@@ -379,14 +545,17 @@ function Dashboard({ session, profile, onSignOut }) {
   async function cancelAppointment(id) {
     if (!window.confirm("Cancel this appointment?")) return;
 
-    const { error } = await supabase
+    const { data: cancelledAppointment, error } = await supabase
       .from("appointments")
       .update({ status: STATUS.CANCELLED })
-      .eq("id", id);
+      .eq("id", id)
+      .select("*")
+      .single();
 
     if (error) setToast({ type: "error", message: error.message });
     else {
       setToast({ type: "success", message: "Appointment cancelled." });
+      await sendAppointmentPush(cancelledAppointment, "CANCELLED", session.user.id);
       await loadAppointments(true);
     }
   }
@@ -427,6 +596,18 @@ function Dashboard({ session, profile, onSignOut }) {
         </div>
 
         <div className="top-actions">
+          <button
+            className="secondary-btn"
+            onClick={handleEnableNotifications}
+            disabled={pushBusy}
+            title={
+              pushEnabled
+                ? "Phone notifications enabled"
+                : "Enable phone notifications"
+            }
+          >
+            🔔 {pushBusy ? "Enabling..." : pushEnabled ? "Notifications On" : "Enable Notifications"}
+          </button>
           <div className="user-pill">
             <div className="avatar">{getInitials(userName)}</div>
             <div className="user-details">
@@ -638,8 +819,8 @@ function AppointmentTable({
                     </div>
                   </div>
                 </td>
-                <td>{a.mobile}</td>
-                <td>{a.doctor_name}</td>
+                <td>{a.mobile || "-"}</td>
+                <td>{a.doctor_name || "-"}</td>
                 <td>{a.treatment || "-"}</td>
                 <td>{a.case_no || "-"}</td>
                 <td>
@@ -689,7 +870,7 @@ function AppointmentTable({
             <div className="appointment-card-top">
               <div>
                 <strong>{a.name}</strong>
-                <span>{a.mobile}</span>
+                <span>{a.mobile || "No mobile number"}</span>
               </div>
               <StatusBadge status={a.status} />
             </div>
@@ -704,7 +885,7 @@ function AppointmentTable({
               </div>
               <div>
                 <span>Doctor</span>
-                <strong>{a.doctor_name}</strong>
+                <strong>{a.doctor_name || "-"}</strong>
               </div>
               <div>
                 <span>Treatment</span>
@@ -782,13 +963,12 @@ function AppointmentModal({ mode, appointment, onClose, onSave }) {
     e.preventDefault();
     setError("");
 
-    if (!form.name.trim() || !form.mobile.trim() || !form.appointment_date ||
-        !form.appointment_time || !form.doctor_name.trim()) {
+    if (!form.name.trim() || !form.appointment_date || !form.appointment_time) {
       setError("Please fill all mandatory fields.");
       return;
     }
 
-    if (!/^\d{10}$/.test(form.mobile.trim())) {
+    if (form.mobile.trim() && !/^\d{10}$/.test(form.mobile.trim())) {
       setError("Enter a valid 10-digit mobile number.");
       return;
     }
@@ -830,11 +1010,11 @@ function AppointmentModal({ mode, appointment, onClose, onSave }) {
             </label>
 
             <label>
-              Mobile Number <span>*</span>
+              Mobile Number
               <input
                 value={form.mobile}
                 onChange={(e) => update("mobile", e.target.value.replace(/\D/g, "").slice(0, 10))}
-                placeholder="10-digit mobile number"
+                placeholder="10-digit mobile number (optional)"
                 inputMode="numeric"
               />
             </label>
@@ -858,11 +1038,11 @@ function AppointmentModal({ mode, appointment, onClose, onSave }) {
             </label>
 
             <label>
-              Doctor Name <span>*</span>
+              Doctor Name
               <input
                 value={form.doctor_name}
                 onChange={(e) => update("doctor_name", e.target.value)}
-                placeholder="e.g. Dr. Rama Raju"
+                placeholder="e.g. Dr. Rama Raju (optional)"
               />
               <small>Same time is allowed for different doctors.</small>
             </label>
