@@ -1,7 +1,9 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   CalendarDays,
+  Check,
   CheckCircle2,
+  ChevronDown,
   Clock3,
   LogOut,
   Pencil,
@@ -13,6 +15,8 @@ import {
   X,
 } from "lucide-react";
 import { supabase, isSupabaseConfigured } from "./lib/supabase";
+
+const CLINIC_NAME = "Sri Satya Sai Oral Health center & Dental Clinic";
 
 const EMPTY_FORM = {
   name: "",
@@ -219,8 +223,8 @@ function SetupScreen() {
   return (
     <div className="center-page">
       <div className="setup-card">
-        <div className="brand-mark">D</div>
-        <h1>Dental Appointment Scheduler</h1>
+        <div className="brand-mark">S</div>
+        <h1>{CLINIC_NAME}</h1>
         <p className="muted">
           Supabase is not configured yet. Add your Supabase URL and publishable
           key to the <code>.env.local</code> file.
@@ -268,8 +272,8 @@ function LoginScreen() {
   return (
     <div className="center-page login-bg">
       <div className="login-card">
-        <div className="brand-mark large">D</div>
-        <h1>Dental Appointment Scheduler</h1>
+        <div className="brand-mark large">S</div>
+        <h1>{CLINIC_NAME}</h1>
         <p className="muted">Doctor & Reception Appointment Management</p>
 
         <form onSubmit={login} className="form-stack">
@@ -322,6 +326,8 @@ function Dashboard({ session, profile, onSignOut }) {
   const [toast, setToast] = useState(null);
   const [pushBusy, setPushBusy] = useState(false);
   const [pushEnabled, setPushEnabled] = useState(false);
+  const [doctorOptions, setDoctorOptions] = useState([]);
+  const [treatmentOptions, setTreatmentOptions] = useState([]);
 
   const userName =
     profile?.full_name || session.user.user_metadata?.full_name || session.user.email;
@@ -329,6 +335,30 @@ function Dashboard({ session, profile, onSignOut }) {
   const doctors = useMemo(() => {
     return [...new Set(appointments.map((a) => a.doctor_name).filter(Boolean))].sort();
   }, [appointments]);
+
+  // Merge the saved doctors/treatments lookup lists with any legacy free-text
+  // values already present in appointments, so nothing already in use is lost.
+  const allDoctorNames = useMemo(() => {
+    const merged = new Map();
+    for (const name of doctorOptions) merged.set(name.toLowerCase(), name);
+    for (const name of doctors) {
+      if (!merged.has(name.toLowerCase())) merged.set(name.toLowerCase(), name);
+    }
+    return [...merged.values()].sort((a, b) => a.localeCompare(b));
+  }, [doctorOptions, doctors]);
+
+  const legacyTreatments = useMemo(() => {
+    return [...new Set(appointments.map((a) => a.treatment).filter(Boolean))].sort();
+  }, [appointments]);
+
+  const allTreatmentNames = useMemo(() => {
+    const merged = new Map();
+    for (const name of treatmentOptions) merged.set(name.toLowerCase(), name);
+    for (const name of legacyTreatments) {
+      if (!merged.has(name.toLowerCase())) merged.set(name.toLowerCase(), name);
+    }
+    return [...merged.values()].sort((a, b) => a.localeCompare(b));
+  }, [treatmentOptions, legacyTreatments]);
 
   const visibleAppointments = useMemo(() => {
     const term = search.trim().toLowerCase();
@@ -456,6 +486,81 @@ function Dashboard({ session, profile, onSignOut }) {
     const timer = setTimeout(() => setToast(null), 3500);
     return () => clearTimeout(timer);
   }, [toast]);
+
+  useEffect(() => {
+    loadLookupLists();
+  }, []);
+
+  async function loadLookupLists() {
+    const [doctorsRes, treatmentsRes] = await Promise.all([
+      supabase.from("doctors").select("name").order("name", { ascending: true }),
+      supabase.from("treatments").select("name").order("name", { ascending: true }),
+    ]);
+
+    if (!doctorsRes.error) {
+      setDoctorOptions((doctorsRes.data || []).map((row) => row.name).filter(Boolean));
+    } else {
+      console.error("Unable to load doctors list:", doctorsRes.error);
+    }
+
+    if (!treatmentsRes.error) {
+      setTreatmentOptions(
+        (treatmentsRes.data || []).map((row) => row.name).filter(Boolean)
+      );
+    } else {
+      console.error("Unable to load treatments list:", treatmentsRes.error);
+    }
+  }
+
+  async function addDoctorOption(name) {
+    const trimmed = name.trim();
+    if (!trimmed) return trimmed;
+
+    setDoctorOptions((current) =>
+      current.some((n) => n.toLowerCase() === trimmed.toLowerCase())
+        ? current
+        : [...current, trimmed].sort((a, b) => a.localeCompare(b))
+    );
+
+    const { error } = await supabase
+      .from("doctors")
+      .upsert({ name: trimmed }, { onConflict: "name", ignoreDuplicates: true });
+
+    if (error) {
+      console.error("Unable to save new doctor:", error);
+      setToast({
+        type: "error",
+        message: "Doctor added for this appointment, but could not be saved for reuse.",
+      });
+    }
+
+    return trimmed;
+  }
+
+  async function addTreatmentOption(name) {
+    const trimmed = name.trim();
+    if (!trimmed) return trimmed;
+
+    setTreatmentOptions((current) =>
+      current.some((n) => n.toLowerCase() === trimmed.toLowerCase())
+        ? current
+        : [...current, trimmed].sort((a, b) => a.localeCompare(b))
+    );
+
+    const { error } = await supabase
+      .from("treatments")
+      .upsert({ name: trimmed }, { onConflict: "name", ignoreDuplicates: true });
+
+    if (error) {
+      console.error("Unable to save new treatment:", error);
+      setToast({
+        type: "error",
+        message: "Treatment added for this appointment, but could not be saved for reuse.",
+      });
+    }
+
+    return trimmed;
+  }
 
   async function loadAppointments(silent = false) {
     if (!silent) setLoading(true);
@@ -588,9 +693,9 @@ function Dashboard({ session, profile, onSignOut }) {
     <div className="app-shell">
       <header className="topbar">
         <div className="brand">
-          <div className="brand-mark">D</div>
+          <div className="brand-mark">S</div>
           <div>
-            <strong>Dental Appointment Scheduler</strong>
+            <strong>{CLINIC_NAME}</strong>
             <span>Doctor & Reception</span>
           </div>
         </div>
@@ -734,6 +839,10 @@ function Dashboard({ session, profile, onSignOut }) {
           appointment={modal.appointment}
           onClose={() => setModal(null)}
           onSave={saveAppointment}
+          doctorOptions={allDoctorNames}
+          treatmentOptions={allTreatmentNames}
+          onAddDoctor={addDoctorOption}
+          onAddTreatment={addTreatmentOption}
         />
       )}
 
@@ -936,7 +1045,209 @@ function StatusBadge({ status }) {
   return <span className={`status ${status.toLowerCase()}`}>{label}</span>;
 }
 
-function AppointmentModal({ mode, appointment, onClose, onSave }) {
+function Combobox({
+  value,
+  onChange,
+  options,
+  onAddOption,
+  placeholder,
+  emptyLabel = "No matches",
+  addLabel = "Add",
+}) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState(value || "");
+  const [adding, setAdding] = useState(false);
+  const rootRef = useRef(null);
+
+  useEffect(() => {
+    setQuery(value || "");
+  }, [value]);
+
+  useEffect(() => {
+    function handleClickOutside(e) {
+      if (rootRef.current && !rootRef.current.contains(e.target)) {
+        setOpen(false);
+        setQuery(value || "");
+      }
+    }
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, [value]);
+
+  const filtered = useMemo(() => {
+    const term = query.trim().toLowerCase();
+    if (!term) return options;
+    return options.filter((opt) => opt.toLowerCase().includes(term));
+  }, [options, query]);
+
+  const trimmedQuery = query.trim();
+  const exactMatch = options.some(
+    (opt) => opt.toLowerCase() === trimmedQuery.toLowerCase()
+  );
+  const canAddNew = trimmedQuery.length > 0 && !exactMatch;
+
+  function selectOption(opt) {
+    onChange(opt);
+    setQuery(opt);
+    setOpen(false);
+  }
+
+  async function handleAddNew() {
+    if (!trimmedQuery || adding) return;
+    setAdding(true);
+    const saved = await onAddOption(trimmedQuery);
+    setAdding(false);
+    selectOption(saved || trimmedQuery);
+  }
+
+  return (
+    <div ref={rootRef} style={{ position: "relative" }}>
+      <div style={{ position: "relative" }}>
+        <input
+          value={query}
+          placeholder={placeholder}
+          onFocus={() => setOpen(true)}
+          onChange={(e) => {
+            setQuery(e.target.value);
+            setOpen(true);
+            onChange(e.target.value);
+          }}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              if (filtered.length === 1) {
+                selectOption(filtered[0]);
+              } else if (canAddNew) {
+                handleAddNew();
+              }
+            } else if (e.key === "Escape") {
+              setOpen(false);
+              setQuery(value || "");
+            }
+          }}
+          style={{
+            width: "100%",
+            boxSizing: "border-box",
+            paddingRight: 34,
+          }}
+          autoComplete="off"
+        />
+        <ChevronDown
+          size={16}
+          onClick={() => setOpen((o) => !o)}
+          style={{
+            position: "absolute",
+            right: 10,
+            top: "50%",
+            transform: open ? "translateY(-50%) rotate(180deg)" : "translateY(-50%)",
+            color: "#6b8f87",
+            cursor: "pointer",
+            transition: "transform 0.15s ease",
+          }}
+        />
+      </div>
+
+      {open && (
+        <div
+          style={{
+            position: "absolute",
+            zIndex: 30,
+            top: "calc(100% + 6px)",
+            left: 0,
+            right: 0,
+            background: "#ffffff",
+            border: "1px solid #dbe6e2",
+            borderRadius: 10,
+            boxShadow: "0 10px 24px rgba(15, 60, 50, 0.12)",
+            maxHeight: 220,
+            overflowY: "auto",
+            padding: 6,
+          }}
+        >
+          {filtered.length === 0 && !canAddNew && (
+            <div style={{ padding: "10px 12px", color: "#7c8b87", fontSize: 13.5 }}>
+              {emptyLabel}
+            </div>
+          )}
+
+          {filtered.map((opt) => {
+            const isSelected = opt.toLowerCase() === (value || "").toLowerCase();
+            return (
+              <button
+                key={opt}
+                type="button"
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => selectOption(opt)}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  width: "100%",
+                  textAlign: "left",
+                  padding: "9px 10px",
+                  borderRadius: 7,
+                  border: "none",
+                  background: isSelected ? "#eaf5f1" : "transparent",
+                  color: "#1c2e2a",
+                  fontSize: 14,
+                  cursor: "pointer",
+                }}
+                onMouseEnter={(e) => {
+                  if (!isSelected) e.currentTarget.style.background = "#f2f7f5";
+                }}
+                onMouseLeave={(e) => {
+                  if (!isSelected) e.currentTarget.style.background = "transparent";
+                }}
+              >
+                <span>{opt}</span>
+                {isSelected && <Check size={15} color="#1f8f6f" />}
+              </button>
+            );
+          })}
+
+          {canAddNew && (
+            <button
+              type="button"
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={handleAddNew}
+              disabled={adding}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+                width: "100%",
+                textAlign: "left",
+                padding: "9px 10px",
+                marginTop: filtered.length ? 4 : 0,
+                borderRadius: 7,
+                border: "1px dashed #b6d8cd",
+                background: "#f6fbf9",
+                color: "#146b52",
+                fontSize: 14,
+                fontWeight: 600,
+                cursor: adding ? "default" : "pointer",
+              }}
+            >
+              <Plus size={15} />
+              {adding ? "Adding..." : `${addLabel} "${trimmedQuery}"`}
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AppointmentModal({
+  mode,
+  appointment,
+  onClose,
+  onSave,
+  doctorOptions,
+  treatmentOptions,
+  onAddDoctor,
+  onAddTreatment,
+}) {
   const [form, setForm] = useState(() => {
     if (!appointment) {
       return { ...EMPTY_FORM, appointment_date: localDateString() };
@@ -1039,10 +1350,14 @@ function AppointmentModal({ mode, appointment, onClose, onSave }) {
 
             <label>
               Doctor Name
-              <input
+              <Combobox
                 value={form.doctor_name}
-                onChange={(e) => update("doctor_name", e.target.value)}
-                placeholder="e.g. Dr. Rama Raju (optional)"
+                onChange={(val) => update("doctor_name", val)}
+                options={doctorOptions}
+                onAddOption={onAddDoctor}
+                placeholder="Search or add a doctor (optional)"
+                emptyLabel="No doctors yet"
+                addLabel="Add doctor"
               />
               <small>Same time is allowed for different doctors.</small>
             </label>
@@ -1061,10 +1376,14 @@ function AppointmentModal({ mode, appointment, onClose, onSave }) {
 
             <label>
               Treatment
-              <input
+              <Combobox
                 value={form.treatment}
-                onChange={(e) => update("treatment", e.target.value)}
-                placeholder="e.g. RCT, Cleaning"
+                onChange={(val) => update("treatment", val)}
+                options={treatmentOptions}
+                onAddOption={onAddTreatment}
+                placeholder="Search or add a treatment"
+                emptyLabel="No treatments yet"
+                addLabel="Add treatment"
               />
             </label>
 
