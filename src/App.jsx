@@ -16,7 +16,8 @@ import {
 } from "lucide-react";
 import { supabase, isSupabaseConfigured } from "./lib/supabase";
 
-const CLINIC_NAME = "Sri Satya Sai Oral Health center & Dental Clinic";
+const CLINIC_NAME_PRIMARY = "Sri Satya Sai";
+const CLINIC_NAME_SECONDARY = "Oral Health Center & Dental Clinic";
 
 const EMPTY_FORM = {
   name: "",
@@ -223,8 +224,11 @@ function SetupScreen() {
   return (
     <div className="center-page">
       <div className="setup-card">
-        <div className="brand-mark">S</div>
-        <h1>{CLINIC_NAME}</h1>
+        <div className="brand-mark" style={{ fontSize: 15, letterSpacing: "-0.02em" }}>SS</div>
+        <h1 style={{ fontSize: 22, lineHeight: 1.25 }}>{CLINIC_NAME_PRIMARY}</h1>
+        <p style={{ fontSize: 13.5, fontWeight: 600, color: "#3d6f63", marginTop: -8 }}>
+          {CLINIC_NAME_SECONDARY}
+        </p>
         <p className="muted">
           Supabase is not configured yet. Add your Supabase URL and publishable
           key to the <code>.env.local</code> file.
@@ -272,8 +276,27 @@ function LoginScreen() {
   return (
     <div className="center-page login-bg">
       <div className="login-card">
-        <div className="brand-mark large">S</div>
-        <h1>{CLINIC_NAME}</h1>
+        <div className="brand-mark large" style={{ fontSize: 22, letterSpacing: "-0.02em" }}>SS</div>
+        <h1
+          style={{
+            fontSize: 30,
+            lineHeight: 1.15,
+            marginBottom: 4,
+            letterSpacing: "-0.01em",
+          }}
+        >
+          {CLINIC_NAME_PRIMARY}
+        </h1>
+        <p
+          style={{
+            fontSize: 15.5,
+            fontWeight: 600,
+            color: "#3d6f63",
+            margin: "0 0 14px",
+          }}
+        >
+          {CLINIC_NAME_SECONDARY}
+        </p>
         <p className="muted">Doctor & Reception Appointment Management</p>
 
         <form onSubmit={login} className="form-stack">
@@ -693,10 +716,12 @@ function Dashboard({ session, profile, onSignOut }) {
     <div className="app-shell">
       <header className="topbar">
         <div className="brand">
-          <div className="brand-mark">S</div>
+          <div className="brand-mark" style={{ fontSize: 15, letterSpacing: "-0.02em" }}>SS</div>
           <div>
-            <strong>{CLINIC_NAME}</strong>
-            <span>Doctor & Reception</span>
+            <strong style={{ fontSize: 15.5, lineHeight: 1.25 }}>{CLINIC_NAME_PRIMARY}</strong>
+            <span style={{ fontSize: 12, color: "#6b8f87", fontWeight: 600 }}>
+              {CLINIC_NAME_SECONDARY}
+            </span>
           </div>
         </div>
 
