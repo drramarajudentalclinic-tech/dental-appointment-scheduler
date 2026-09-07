@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+
 import {
   CalendarDays,
   Check,
@@ -35,6 +35,19 @@ const STATUS = {
   COMPLETED: "COMPLETED",
   CANCELLED: "CANCELLED",
 };
+
+const ROLE = {
+  JUNIOR_DOCTOR: "junior_doctor",
+};
+
+function normalizeRole(role) {
+  return String(role || "").trim().toLowerCase().replace(/[- ]+/g, "_");
+}
+
+function isJuniorDoctor(profile) {
+  const role = normalizeRole(profile?.role);
+  return [ROLE.JUNIOR_DOCTOR, "junior", "juniordoctor"].includes(role);
+}
 
 // Android Web Push configuration. Only the public VAPID key belongs in the frontend.
 const VAPID_PUBLIC_KEY = import.meta.env.VITE_VAPID_PUBLIC_KEY || "";
@@ -172,6 +185,7 @@ function App() {
   const [session, setSession] = useState(null);
   const [authLoading, setAuthLoading] = useState(true);
   const [profile, setProfile] = useState(null);
+  const [profileLoading, setProfileLoading] = useState(false);
 
   useEffect(() => {
     if (!supabase) {
@@ -196,20 +210,24 @@ function App() {
   useEffect(() => {
     if (!session?.user?.id || !supabase) {
       setProfile(null);
+      setProfileLoading(false);
       return;
     }
 
+    setProfileLoading(true);
     supabase
       .from("profiles")
       .select("id, full_name, role")
       .eq("id", session.user.id)
       .maybeSingle()
-      .then(({ data }) => setProfile(data || null));
+      .then(({ data }) => setProfile(data || null))
+      .finally(() => setProfileLoading(false));
   }, [session]);
 
   if (!isSupabaseConfigured) return <SetupScreen />;
   if (authLoading) return <LoadingScreen />;
   if (!session) return <LoginScreen />;
+  if (profileLoading) return <LoadingScreen />;
 
   return (
     <Dashboard
@@ -370,9 +388,12 @@ function Dashboard({ session, profile, onSignOut }) {
   const [pushEnabled, setPushEnabled] = useState(false);
   const [doctorOptions, setDoctorOptions] = useState([]);
   const [treatmentOptions, setTreatmentOptions] = useState([]);
+  const [showManageDoctors, setShowManageDoctors] = useState(false);
 
   const userName =
     profile?.full_name || session.user.user_metadata?.full_name || session.user.email;
+
+  const juniorDoctor = isJuniorDoctor(profile);
 
   const doctors = useMemo(() => {
     return [...new Set(appointments.map((a) => a.doctor_name).filter(Boolean))].sort();
@@ -414,7 +435,7 @@ function Dashboard({ session, profile, onSignOut }) {
       if (term) {
         const haystack = [
           a.name,
-          a.mobile,
+          ...(juniorDoctor ? [] : [a.mobile]),
           a.case_no,
           a.treatment,
           a.doctor_name,
@@ -428,7 +449,7 @@ function Dashboard({ session, profile, onSignOut }) {
 
       return true;
     });
-  }, [appointments, view, selectedDate, search, doctorFilter]);
+  }, [appointments, view, selectedDate, search, doctorFilter, juniorDoctor]);
 
   const counts = useMemo(() => {
     const today = appointments.filter(
@@ -486,7 +507,13 @@ function Dashboard({ session, profile, onSignOut }) {
   }
 
   useEffect(() => {
+    if (profileLoading) return;
+
     loadAppointments();
+
+    // Junior Doctors use the secure database view and do not subscribe to raw
+    // appointment payloads, because realtime payloads can contain mobile.
+    if (juniorDoctor) return undefined;
 
     const channel = supabase
       .channel("appointments-live")
@@ -494,8 +521,6 @@ function Dashboard({ session, profile, onSignOut }) {
         "postgres_changes",
         { event: "*", schema: "public", table: "appointments" },
         (payload) => {
-          // Realtime is used for live dashboard updates and in-app toasts.
-          // System notifications are sent by the Edge Function to avoid duplicates.
           if (payload.eventType === "INSERT") {
             const appointment = payload.new;
             const bookedByMe = appointment.created_by === session.user.id;
@@ -521,7 +546,7 @@ function Dashboard({ session, profile, onSignOut }) {
     return () => {
       supabase.removeChannel(channel);
     };
-  }, []);
+  }, [juniorDoctor, profileLoading, session.user.id]);
 
   useEffect(() => {
     if (!toast) return;
@@ -579,6 +604,32 @@ function Dashboard({ session, profile, onSignOut }) {
     return trimmed;
   }
 
+  async function deleteDoctorOption(name) {
+    const trimmed = name.trim();
+    if (!trimmed) return;
+
+    if (
+      !window.confirm(`Remove "${trimmed}" from the doctor list? Past appointments already using this name are not affected.`)
+    ) {
+      return;
+    }
+
+    const previous = doctorOptions;
+    setDoctorOptions((current) =>
+      current.filter((n) => n.toLowerCase() !== trimmed.toLowerCase())
+    );
+
+    const { error } = await supabase.from("doctors").delete().ilike("name", trimmed);
+
+    if (error) {
+      console.error("Unable to delete doctor:", error);
+      setDoctorOptions(previous);
+      setToast({ type: "error", message: "Unable to remove that doctor. Please try again." });
+    } else {
+      setToast({ type: "success", message: `"${trimmed}" removed from the doctor list.` });
+    }
+  }
+
   async function addTreatmentOption(name) {
     const trimmed = name.trim();
     if (!trimmed) return trimmed;
@@ -608,8 +659,12 @@ function Dashboard({ session, profile, onSignOut }) {
     if (!silent) setLoading(true);
     else setSyncing(true);
 
+    const sourceTable = juniorDoctor
+      ? "junior_doctor_appointments"
+      : "appointments";
+
     const { data, error } = await supabase
-      .from("appointments")
+      .from(sourceTable)
       .select("*")
       .order("appointment_date", { ascending: true })
       .order("appointment_time", { ascending: true });
@@ -625,6 +680,11 @@ function Dashboard({ session, profile, onSignOut }) {
   }
 
   async function saveAppointment(form, editingId) {
+    if (juniorDoctor) {
+      setToast({ type: "error", message: "Junior Doctors have read-only access." });
+      return false;
+    }
+
     const payload = {
       name: form.name.trim(),
       mobile: form.mobile.trim() || null,
@@ -677,6 +737,11 @@ function Dashboard({ session, profile, onSignOut }) {
   }
 
   async function completeAppointment(id) {
+    if (juniorDoctor) {
+      setToast({ type: "error", message: "Junior Doctors have read-only access." });
+      return;
+    }
+
     const { error } = await supabase
       .from("appointments")
       .update({ status: STATUS.COMPLETED })
@@ -690,6 +755,11 @@ function Dashboard({ session, profile, onSignOut }) {
   }
 
   async function cancelAppointment(id) {
+    if (juniorDoctor) {
+      setToast({ type: "error", message: "Junior Doctors have read-only access." });
+      return;
+    }
+
     if (!window.confirm("Cancel this appointment?")) return;
 
     const { data: cancelledAppointment, error } = await supabase
@@ -708,6 +778,11 @@ function Dashboard({ session, profile, onSignOut }) {
   }
 
   async function permanentlyDelete(id) {
+    if (juniorDoctor) {
+      setToast({ type: "error", message: "Junior Doctors have read-only access." });
+      return;
+    }
+
     if (
       !window.confirm(
         "Permanently delete this appointment? This cannot be undone."
@@ -810,13 +885,17 @@ function Dashboard({ session, profile, onSignOut }) {
             <p className="eyebrow">CLINIC SCHEDULE</p>
             <h1>Appointments</h1>
             <p className="muted">
-              Doctor and receptionist changes sync automatically across devices.
+              {juniorDoctor
+                ? "Read-only appointment view. Use the date filters to view past, today, or future appointments."
+                : "Doctor and receptionist changes sync automatically across devices."}
             </p>
           </div>
-          <button className="primary-btn" onClick={() => setModal({ type: "create" })}>
-            <Plus size={19} />
-            New Appointment
-          </button>
+          {!juniorDoctor && (
+            <button className="primary-btn" onClick={() => setModal({ type: "create" })}>
+              <Plus size={19} />
+              New Appointment
+            </button>
+          )}
         </section>
 
         <section className="stats-grid">
@@ -853,7 +932,7 @@ function Dashboard({ session, profile, onSignOut }) {
               <input
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
-                placeholder="Search name, mobile, case no..."
+                placeholder={juniorDoctor ? "Search name, case no., treatment..." : "Search name, mobile, case no..."}
               />
             </div>
 
@@ -868,6 +947,18 @@ function Dashboard({ session, profile, onSignOut }) {
                 </option>
               ))}
             </select>
+
+            {!juniorDoctor && (
+              <button
+                type="button"
+                className="secondary-btn"
+                onClick={() => setShowManageDoctors(true)}
+                title="Add or remove doctors from the list"
+              >
+                <UserRound size={16} />
+                Manage Doctors
+              </button>
+            )}
           </div>
         </section>
 
@@ -903,11 +994,12 @@ function Dashboard({ session, profile, onSignOut }) {
             onComplete={completeAppointment}
             onCancel={cancelAppointment}
             onDelete={permanentlyDelete}
+            readOnly={juniorDoctor}
           />
         )}
       </main>
 
-      {modal && (
+      {!juniorDoctor && modal && (
         <AppointmentModal
           mode={modal.type}
           appointment={modal.appointment}
@@ -917,6 +1009,16 @@ function Dashboard({ session, profile, onSignOut }) {
           treatmentOptions={allTreatmentNames}
           onAddDoctor={addDoctorOption}
           onAddTreatment={addTreatmentOption}
+          onDeleteDoctor={deleteDoctorOption}
+        />
+      )}
+
+      {!juniorDoctor && showManageDoctors && (
+        <ManageDoctorsModal
+          doctors={allDoctorNames}
+          onClose={() => setShowManageDoctors(false)}
+          onAddDoctor={addDoctorOption}
+          onDeleteDoctor={deleteDoctorOption}
         />
       )}
 
@@ -950,6 +1052,7 @@ function AppointmentTable({
   onComplete,
   onCancel,
   onDelete,
+  readOnly = false,
 }) {
   if (!appointments.length) {
     return (
@@ -980,7 +1083,7 @@ function AppointmentTable({
               <th>Date</th>
               <th>Time</th>
               <th>Patient</th>
-              <th>Mobile</th>
+              {!readOnly && <th>Mobile</th>}
               <th>Doctor</th>
               <th>Treatment</th>
               <th>Case No.</th>
@@ -1002,7 +1105,7 @@ function AppointmentTable({
                     </div>
                   </div>
                 </td>
-                <td>{a.mobile || "-"}</td>
+                {!readOnly && <td>{a.mobile || "-"}</td>}
                 <td>{a.doctor_name || "-"}</td>
                 <td>{a.treatment || "-"}</td>
                 <td>{a.case_no || "-"}</td>
@@ -1010,36 +1113,40 @@ function AppointmentTable({
                   <StatusBadge status={a.status} />
                 </td>
                 <td>
-                  <div className="actions">
-                    <button className="small-btn" onClick={() => onEdit(a)} title="Edit">
-                      <Pencil size={15} />
-                    </button>
-                    {a.status === STATUS.SCHEDULED && (
-                      <button
-                        className="small-btn success"
-                        onClick={() => onComplete(a.id)}
-                        title="Mark completed"
-                      >
-                        <CheckCircle2 size={15} />
+                  {readOnly ? (
+                    <span className="muted small">View only</span>
+                  ) : (
+                    <div className="actions">
+                      <button className="small-btn" onClick={() => onEdit(a)} title="Edit">
+                        <Pencil size={15} />
                       </button>
-                    )}
-                    {a.status !== STATUS.CANCELLED && (
+                      {a.status === STATUS.SCHEDULED && (
+                        <button
+                          className="small-btn success"
+                          onClick={() => onComplete(a.id)}
+                          title="Mark completed"
+                        >
+                          <CheckCircle2 size={15} />
+                        </button>
+                      )}
+                      {a.status !== STATUS.CANCELLED && (
+                        <button
+                          className="small-btn danger"
+                          onClick={() => onCancel(a.id)}
+                          title="Cancel"
+                        >
+                          <X size={15} />
+                        </button>
+                      )}
                       <button
                         className="small-btn danger"
-                        onClick={() => onCancel(a.id)}
-                        title="Cancel"
+                        onClick={() => onDelete(a.id)}
+                        title="Delete permanently"
                       >
-                        <X size={15} />
+                        <Trash2 size={15} />
                       </button>
-                    )}
-                    <button
-                      className="small-btn danger"
-                      onClick={() => onDelete(a.id)}
-                      title="Delete permanently"
-                    >
-                      <Trash2 size={15} />
-                    </button>
-                  </div>
+                    </div>
+                  )}
                 </td>
               </tr>
             ))}
@@ -1053,7 +1160,7 @@ function AppointmentTable({
             <div className="appointment-card-top">
               <div>
                 <strong>{a.name}</strong>
-                <span>{a.mobile || "No mobile number"}</span>
+                {!readOnly && <span>{a.mobile || "No mobile number"}</span>}
               </div>
               <StatusBadge status={a.status} />
             </div>
@@ -1083,24 +1190,30 @@ function AppointmentTable({
                 <strong>{a.age ?? "-"}</strong>
               </div>
             </div>
-            <div className="mobile-actions">
-              <button className="secondary-btn" onClick={() => onEdit(a)}>
-                <Pencil size={15} /> Edit
-              </button>
-              {a.status === STATUS.SCHEDULED && (
-                <button className="secondary-btn" onClick={() => onComplete(a.id)}>
-                  <CheckCircle2 size={15} /> Complete
+            {!readOnly ? (
+              <div className="mobile-actions">
+                <button className="secondary-btn" onClick={() => onEdit(a)}>
+                  <Pencil size={15} /> Edit
                 </button>
-              )}
-              {a.status !== STATUS.CANCELLED && (
-                <button className="secondary-btn danger-text" onClick={() => onCancel(a.id)}>
-                  Cancel
+                {a.status === STATUS.SCHEDULED && (
+                  <button className="secondary-btn" onClick={() => onComplete(a.id)}>
+                    <CheckCircle2 size={15} /> Complete
+                  </button>
+                )}
+                {a.status !== STATUS.CANCELLED && (
+                  <button className="secondary-btn danger-text" onClick={() => onCancel(a.id)}>
+                    Cancel
+                  </button>
+                )}
+                <button className="secondary-btn danger-text" onClick={() => onDelete(a.id)}>
+                  Delete
                 </button>
-              )}
-              <button className="secondary-btn danger-text" onClick={() => onDelete(a.id)}>
-                Delete
-              </button>
-            </div>
+              </div>
+            ) : (
+              <div className="mobile-actions">
+                <span className="muted small">View only</span>
+              </div>
+            )}
           </div>
         ))}
       </div>
@@ -1124,6 +1237,7 @@ function Combobox({
   onChange,
   options,
   onAddOption,
+  onDeleteOption,
   placeholder,
   emptyLabel = "No matches",
   addLabel = "Add",
@@ -1131,6 +1245,7 @@ function Combobox({
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState(value || "");
   const [adding, setAdding] = useState(false);
+  const [deletingOpt, setDeletingOpt] = useState(null);
   const rootRef = useRef(null);
 
   useEffect(() => {
@@ -1172,6 +1287,18 @@ function Combobox({
     const saved = await onAddOption(trimmedQuery);
     setAdding(false);
     selectOption(saved || trimmedQuery);
+  }
+
+  async function handleDelete(opt) {
+    if (!onDeleteOption || deletingOpt) return;
+    setDeletingOpt(opt);
+    await onDeleteOption(opt);
+    setDeletingOpt(null);
+    // Keep the dropdown open so more than one entry can be removed at a time.
+    if (opt.toLowerCase() === (value || "").toLowerCase()) {
+      onChange("");
+      setQuery("");
+    }
   }
 
   return (
@@ -1246,36 +1373,89 @@ function Combobox({
 
           {filtered.map((opt) => {
             const isSelected = opt.toLowerCase() === (value || "").toLowerCase();
+            const isDeleting = deletingOpt === opt;
             return (
-              <button
+              <div
                 key={opt}
-                type="button"
-                onMouseDown={(e) => e.preventDefault()}
-                onClick={() => selectOption(opt)}
                 style={{
                   display: "flex",
                   alignItems: "center",
-                  justifyContent: "space-between",
-                  width: "100%",
-                  textAlign: "left",
-                  padding: "9px 10px",
-                  borderRadius: 7,
-                  border: "none",
-                  background: isSelected ? "#eaf5f1" : "transparent",
-                  color: "#1c2e2a",
-                  fontSize: 14,
-                  cursor: "pointer",
-                }}
-                onMouseEnter={(e) => {
-                  if (!isSelected) e.currentTarget.style.background = "#f2f7f5";
-                }}
-                onMouseLeave={(e) => {
-                  if (!isSelected) e.currentTarget.style.background = "transparent";
+                  gap: 4,
                 }}
               >
-                <span>{opt}</span>
-                {isSelected && <Check size={15} color="#1f8f6f" />}
-              </button>
+                <button
+                  type="button"
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => selectOption(opt)}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    flex: 1,
+                    minWidth: 0,
+                    textAlign: "left",
+                    padding: "9px 10px",
+                    borderRadius: 7,
+                    border: "none",
+                    background: isSelected ? "#eaf5f1" : "transparent",
+                    color: "#1c2e2a",
+                    fontSize: 14,
+                    cursor: "pointer",
+                  }}
+                  onMouseEnter={(e) => {
+                    if (!isSelected) e.currentTarget.style.background = "#f2f7f5";
+                  }}
+                  onMouseLeave={(e) => {
+                    if (!isSelected) e.currentTarget.style.background = "transparent";
+                  }}
+                >
+                  <span
+                    style={{
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      whiteSpace: "nowrap",
+                    }}
+                  >
+                    {opt}
+                  </span>
+                  {isSelected && <Check size={15} color="#1f8f6f" />}
+                </button>
+
+                {onDeleteOption && (
+                  <button
+                    type="button"
+                    title={`Remove "${opt}"`}
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={() => handleDelete(opt)}
+                    disabled={isDeleting}
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      flexShrink: 0,
+                      width: 30,
+                      height: 30,
+                      borderRadius: 7,
+                      border: "1px solid transparent",
+                      background: "transparent",
+                      color: isDeleting ? "#c3d1cd" : "#c0554a",
+                      cursor: isDeleting ? "default" : "pointer",
+                    }}
+                    onMouseEnter={(e) => {
+                      if (!isDeleting) {
+                        e.currentTarget.style.background = "#fbecea";
+                        e.currentTarget.style.borderColor = "#f0d0cc";
+                      }
+                    }}
+                    onMouseLeave={(e) => {
+                      e.currentTarget.style.background = "transparent";
+                      e.currentTarget.style.borderColor = "transparent";
+                    }}
+                  >
+                    <Trash2 size={14} />
+                  </button>
+                )}
+              </div>
             );
           })}
 
@@ -1312,6 +1492,139 @@ function Combobox({
   );
 }
 
+function ManageDoctorsModal({ doctors, onClose, onAddDoctor, onDeleteDoctor }) {
+  const [newName, setNewName] = useState("");
+  const [adding, setAdding] = useState(false);
+  const [deletingName, setDeletingName] = useState(null);
+
+  async function handleAdd(e) {
+    e.preventDefault();
+    const trimmed = newName.trim();
+    if (!trimmed || adding) return;
+    setAdding(true);
+    await onAddDoctor(trimmed);
+    setAdding(false);
+    setNewName("");
+  }
+
+  async function handleDelete(name) {
+    if (deletingName) return;
+    setDeletingName(name);
+    await onDeleteDoctor(name);
+    setDeletingName(null);
+  }
+
+  return (
+    <div className="modal-backdrop" onMouseDown={onClose}>
+      <div className="modal-card" onMouseDown={(e) => e.stopPropagation()}>
+        <div className="modal-header">
+          <div>
+            <p className="eyebrow">DOCTORS</p>
+            <h2>Manage Doctors</h2>
+          </div>
+          <button className="icon-btn" onClick={onClose}>
+            <X />
+          </button>
+        </div>
+
+        <form onSubmit={handleAdd} style={{ display: "flex", gap: 8, marginBottom: 14 }}>
+          <input
+            value={newName}
+            onChange={(e) => setNewName(e.target.value)}
+            placeholder="Add a new doctor name"
+            style={{ flex: 1 }}
+          />
+          <button className="primary-btn" disabled={adding || !newName.trim()}>
+            {adding ? "Adding..." : "Add"}
+          </button>
+        </form>
+
+        <div
+          style={{
+            border: "1px solid #dbe6e2",
+            borderRadius: 10,
+            maxHeight: 340,
+            overflowY: "auto",
+          }}
+        >
+          {doctors.length === 0 && (
+            <div style={{ padding: "16px 14px", color: "#7c8b87", fontSize: 13.5 }}>
+              No doctors added yet.
+            </div>
+          )}
+
+          {doctors.map((name, i) => {
+            const isDeleting = deletingName === name;
+            return (
+              <div
+                key={name}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: 10,
+                  padding: "10px 14px",
+                  borderTop: i === 0 ? "none" : "1px solid #eef3f1",
+                }}
+              >
+                <span style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
+                  <UserRound size={16} color="#3d6f63" />
+                  <span
+                    style={{
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      whiteSpace: "nowrap",
+                      fontSize: 14.5,
+                      color: "#1c2e2a",
+                    }}
+                  >
+                    {name}
+                  </span>
+                </span>
+
+                <button
+                  type="button"
+                  title={`Delete "${name}"`}
+                  onClick={() => handleDelete(name)}
+                  disabled={isDeleting}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 6,
+                    flexShrink: 0,
+                    padding: "6px 10px",
+                    borderRadius: 7,
+                    border: "1px solid #f0d0cc",
+                    background: isDeleting ? "#f7f7f7" : "#fbecea",
+                    color: isDeleting ? "#a7a7a7" : "#c0554a",
+                    fontSize: 13,
+                    fontWeight: 600,
+                    cursor: isDeleting ? "default" : "pointer",
+                  }}
+                >
+                  <Trash2 size={14} />
+                  {isDeleting ? "Deleting..." : "Delete"}
+                </button>
+              </div>
+            );
+          })}
+        </div>
+
+        <p className="muted small" style={{ marginTop: 12 }}>
+          Deleting a doctor here only removes them from this list for new appointments.
+          Existing appointments already booked under that name are not affected.
+        </p>
+
+        <div className="modal-actions">
+          <button type="button" className="secondary-btn" onClick={onClose}>
+            Close
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function AppointmentModal({
   mode,
   appointment,
@@ -1321,6 +1634,7 @@ function AppointmentModal({
   treatmentOptions,
   onAddDoctor,
   onAddTreatment,
+  onDeleteDoctor,
 }) {
   const [form, setForm] = useState(() => {
     if (!appointment) {
@@ -1429,6 +1743,7 @@ function AppointmentModal({
                 onChange={(val) => update("doctor_name", val)}
                 options={doctorOptions}
                 onAddOption={onAddDoctor}
+                onDeleteOption={onDeleteDoctor}
                 placeholder="Search or add a doctor (optional)"
                 emptyLabel="No doctors yet"
                 addLabel="Add doctor"
