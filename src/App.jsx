@@ -1,4 +1,3 @@
-
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   CalendarDays,
@@ -234,6 +233,7 @@ function App() {
     <Dashboard
       session={session}
       profile={profile}
+      profileLoading={profileLoading}
       onSignOut={() => supabase.auth.signOut()}
     />
   );
@@ -375,7 +375,7 @@ function LoginScreen() {
   );
 }
 
-function Dashboard({ session, profile, onSignOut }) {
+function Dashboard({ session, profile, profileLoading, onSignOut }) {
   const [appointments, setAppointments] = useState([]);
   const [loading, setLoading] = useState(true);
   const [syncing, setSyncing] = useState(false);
