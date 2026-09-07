@@ -288,7 +288,14 @@ function LoadingScreen() {
   );
 }
 
+const LOGIN_ROLE_OPTIONS = [
+  { value: "doctor", label: "Doctor" },
+  { value: "receptionist", label: "Receptionist" },
+  { value: "junior_doctor", label: "Junior Doctor" },
+];
+
 function LoginScreen() {
+  const [role, setRole] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
@@ -303,7 +310,17 @@ function LoginScreen() {
       password,
     });
     setBusy(false);
-    if (loginError) setError(loginError.message);
+    if (loginError) {
+      setError(loginError.message);
+      return;
+    }
+    // Stored for reference only; the account's actual role/permissions
+    // still come from the `profiles` table after sign-in.
+    try {
+      localStorage.setItem("dental_selected_login_role", role);
+    } catch {
+      // ignore storage errors (e.g. private browsing)
+    }
   }
 
   return (
@@ -338,6 +355,33 @@ function LoginScreen() {
         <p className="muted">Doctor & Reception Appointment Management</p>
 
         <form onSubmit={login} className="form-stack">
+          <label>
+            Role
+            <select
+              value={role}
+              onChange={(e) => setRole(e.target.value)}
+              required
+              style={{
+                width: "100%",
+                padding: "10px 12px",
+                borderRadius: 8,
+                border: "1px solid #d7ddd9",
+                fontSize: 14,
+                background: "#fff",
+                color: role ? "#1b1b1b" : "#8a938e",
+              }}
+            >
+              <option value="" disabled>
+                Select your role
+              </option>
+              {LOGIN_ROLE_OPTIONS.map((opt) => (
+                <option key={opt.value} value={opt.value}>
+                  {opt.label}
+                </option>
+              ))}
+            </select>
+          </label>
+
           <label>
             Email
             <input
